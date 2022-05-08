@@ -120,9 +120,8 @@ class JeffreysLinear(NormalLinear):
     def scale(self):
         q_var = tfm.exp(self.q_log_var)
         z_var = tfm.exp(self.z_log_var)
-        p_var = (
-            (q_var * (self.z_loc**2)) + (z_var * (self.q_loc**2)) + (z_var * q_var)
-        )
+        p_var = q_var * (self.z_loc**2)
+        p_var += z_var * (self.q_loc**2 + q_var)
         return tfm.exp(0.5 * tfm.log(p_var))
 
     @property
@@ -136,10 +135,9 @@ class JeffreysLinear(NormalLinear):
         # KL(q(z)||p(z))
         k1, k2, k3 = 0.63576, 1.87320, 1.48695
         log_alpha = self.log_dropout_rate
-        kl = -tf.reduce_sum(
-            k1 * tfm.sigmoid(k2 + k3 * log_alpha) - 0.5 * tfm.softplus(-log_alpha) - k1
-        )
-        return kl
+        kl = -k1 * tfm.sigmoid(k2 + k3 * log_alpha)
+        kl += 0.5 * tfm.softplus(-log_alpha) + k1
+        return tf.reduce_sum(kl)
 
     @property
     def kl(self):
@@ -157,46 +155,50 @@ class HorseshoeLinear(BaseLinear):
     def _initialize(self, x):
         super()._initialize(x)
 
-        # initialize parameter values
-        stdev = 1.0 / tf.sqrt(tf.cast(self.input_size, tf.float32))
-        sa_loc = 1.0
-        sb_loc = 1.0
-        a_loc = tf.ones(self.param_shape)
-        b_loc = tf.ones(self.param_shape)
-        q_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
+        tau0 = 1.0
+        sa_loc = 0.0
+        sb_loc = 0.0
         sa_log_var = -9.0 + 1e-2 * tf.random.normal(())
         sb_log_var = -9.0 + 1e-2 * tf.random.normal(())
+
+        a_loc = tf.zeros(self.param_shape)
+        b_loc = tf.zeros(self.param_shape)
         a_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
         b_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
-        tau0 = 1.0
 
         self.tau0 = tf.Variable(tau0, name="tau0")
-        self.a_loc = tf.Variable(a_loc, name="a_loc")
-        self.b_loc = tf.Variable(b_loc, name="b_loc")
         self.sa_loc = tf.Variable(sa_loc, name="sa_loc")
         self.sb_loc = tf.Variable(sb_loc, name="sb_loc")
-        self.a_log_var = tf.Variable(a_log_var, name="a_log_var")
-        self.b_log_var = tf.Variable(b_log_var, name="b_log_var")
         self.sa_log_var = tf.Variable(sa_log_var, name="sa_log_var")
         self.sb_log_var = tf.Variable(sb_log_var, name="sb_log_var")
+        self.a_loc = tf.Variable(a_loc, name="a_loc")
+        self.b_loc = tf.Variable(b_loc, name="b_loc")
+        self.a_log_var = tf.Variable(a_log_var, name="a_log_var")
+        self.b_log_var = tf.Variable(b_log_var, name="b_log_var")
 
     @property
-    def scale(self):
+    def z_loc(self):
+        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
+        zt_loc = 0.5 * (self.a_loc + self.b_loc)
+        z_loc = zt_loc + s_loc
+        return z_loc
+
+    @property
+    def z_var(self):
         sa_var = tfm.exp(self.sa_log_var)
         sb_var = tfm.exp(self.sb_log_var)
         s_var = 0.25 * (sa_var + sb_var)
-        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
-
         a_var = tfm.exp(self.a_log_var)
         b_var = tfm.exp(self.b_log_var)
         zt_var = 0.25 * (a_var + b_var)
-        zt_loc = 0.5 * (self.a_loc + self.b_loc)
-
-        z_loc = zt_loc + s_loc
         z_var = zt_var + s_var
+        return z_var
 
+    @property
+    def scale(self):
         q_var = tfm.exp(self.q_log_var)
-
+        z_loc = self.z_loc
+        z_var = self.z_var
         v = (
             (tfm.exp(z_var) - 1)
             * tfm.exp(2.0 * z_loc + z_var)
@@ -207,40 +209,13 @@ class HorseshoeLinear(BaseLinear):
 
     @property
     def loc(self):
-        sa_var = tfm.exp(self.sa_log_var)
-        sb_var = tfm.exp(self.sb_log_var)
-        s_var = 0.25 * (sa_var + sb_var)
-        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
-
-        a_var = tfm.exp(self.a_log_var)
-        b_var = tfm.exp(self.b_log_var)
-        zt_var = 0.25 * (a_var + b_var)
-        zt_loc = 0.5 * (self.a_loc + self.b_loc)
-
-        z_loc = zt_loc + s_loc
-        z_var = zt_var + s_var
-        return tfm.exp(z_loc + 0.5 * z_var) * self.q_loc
+        return tfm.exp(self.z_loc + 0.5 * self.z_var) * self.q_loc
 
     def sample_posterior(self, batch_size: int):
-        sa_var = tfm.exp(self.sa_log_var)
-        sb_var = tfm.exp(self.sb_log_var)
-        s_var = 0.25 * (sa_var + sb_var)
-        s_scale = tfm.exp(0.5 * tfm.log(s_var))
-        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
-
-        a_var = tfm.exp(self.a_log_var)
-        b_var = tfm.exp(self.b_log_var)
-        zt_var = 0.25 * (a_var + b_var)
-        zt_scale = tfm.exp(0.5 * tfm.log(zt_var))
-        zt_loc = 0.5 * (self.a_loc + self.b_loc)
-
-        s = tfpd.LogNormal(s_loc, s_scale).sample(batch_size)
-        zt = tfpd.LogNormal(zt_loc, zt_scale).sample(batch_size)
+        z = tfpd.LogNormal(self.z_loc, self.z_var).sample(batch_size)
         q_scale = tfm.exp(0.5 * self.q_log_var)
         wt = tfpd.Normal(self.q_loc, q_scale).sample(batch_size)
-        w = s[..., None, None] * zt * wt
-
-        return w
+        return z * wt
 
     @property
     def sa_kl(self):

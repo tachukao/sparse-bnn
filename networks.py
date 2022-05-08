@@ -251,7 +251,7 @@ class HorseshoeLinear(BaseLinear):
         return super().kl + self.sa_kl + self.sb_kl + self.a_kl + self.b_kl
 
 
-layer_collection = {
+layer_mapping = {
     "normal": NormalLinear,
     "jeffreys": JeffreysLinear,
     "horseshoe": HorseshoeLinear,
@@ -262,14 +262,13 @@ class BNN(snt.Module):
     def __init__(
         self,
         output_sizes: Iterable[int] = [300, 100, 10],
-        weight_prior: str = "normal",
+        prior: str = "normal",
         name=None,
     ):
         super().__init__(name=name)
         self.output_sizes = output_sizes
         self.flatten = snt.Flatten()
-        build_layer = layer_collection[weight_prior]
-
+        build_layer = layer_mapping[prior]
         self.layers = [
             build_layer(size, name=f"layer{l}") for (l, size) in enumerate(output_sizes)
         ]

@@ -1,3 +1,4 @@
+from typing import Iterable, Optional
 import sonnet as snt
 import tensorflow as tf
 import tensorflow.math as tfm
@@ -8,65 +9,89 @@ softplus = tfm.softplus
 softplus_inverse = tfp.math.softplus_inverse
 
 
-class Layer(snt.Module):
+class BaseLinear(snt.Module):
     def __init__(self, output_size, name=None):
         super().__init__(name=name)
         self.output_size = output_size
 
-    @snt.once
-    def _initialize(self, x):
-        self.input_size = x.shape[-1] + 1
-        initial_w = tf.random.normal([self.output_size, self.input_size]) / tf.sqrt(
-            tf.cast(self.input_size, tf.float32)
-        )
-        self._loc = tf.Variable(initial_w, name="loc")
-        self._scale = tf.Variable(
-            softplus_inverse(1e-3) * tf.ones([self.output_size, self.input_size]),
-            name="scale",
-        )
-        self._prior_scale = tf.Variable(softplus_inverse(1e-3), name="prior_scale")
-
     @property
     def loc(self):
-        return self._loc
+        raise NotImplementedError("loc not implemented.")
 
     @property
     def scale(self):
-        return softplus(self._scale)
+        raise NotImplementedError("scale not implemented.")
+
+    def kl(self):
+        raise NotImplementedError("KL not implemented.")
+
+    def sample_posterior(self, batch_size: int):
+        raise NotImplementedError("sample_posterior not implemented.")
 
     @property
     def prior_scale(self):
-        return softplus(self._prior_scale)
+        return tfm.exp(0.5 * self.prior_log_var)
 
-    @property
-    def post_dist(self):
-        post_dist = tfpd.Normal(self.loc, self.scale)
-        return post_dist
+    @snt.once
+    def _initialize(self, x):
+        self.input_size = x.shape[-1] + 1
+        self.param_shape = [self.output_size, self.input_size]
 
-    @property
-    def prior_dist(self):
-        shp = (self.output_size, self.input_size)
-        return tfpd.Normal(tf.zeros(shp), self.prior_scale * tf.ones(shp))
+        # initialize parameter values
+        stdev = 1.0 / tf.sqrt(tf.cast(self.input_size, tf.float32))
+        q_loc = stdev * tf.random.normal(self.param_shape)
+        q_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
+        prior_log_var = 0.0
+
+        self.q_loc = tf.Variable(q_loc, name="q_loc")
+        self.q_log_var = tf.Variable(q_log_var, name="q_log_var")
+        self.prior_log_var = tf.Variable(prior_log_var, name="prior_log_var")
 
     def __call__(self, x):
         self._initialize(x)
         batch_size = tf.shape(x)[0]
-        param = self.post_dist.sample(batch_size)
+        param = self.sample_posterior(batch_size)
         w = param[..., :-1]
         b = param[..., -1]
         y = tf.linalg.matvec(w, x) + b
         return y
 
-    def kl(self):
-        return tf.math.reduce_sum(self.post_dist.kl_divergence(self.prior_dist))
-
     def predict(self, x):
-        w = self.loc[..., :-1]
-        b = self.loc[..., -1]
+        loc = self.loc
+        w = loc[..., :-1]
+        b = loc[..., -1]
         return (x @ tf.transpose(w)) + b
 
+    @property
+    def kl(self):
+        q_scale = tfm.exp(0.5 * self.q_log_var)
+        d1 = tfpd.Normal(self.q_loc, q_scale)
+        d2 = tfpd.Normal(
+            tf.zeros(self.param_shape), self.prior_scale * tf.ones(self.param_shape)
+        )
+        return tf.reduce_sum(d1.kl_divergence(d2))
 
-def NJLayer(Layer):
+
+class NormalLinear(BaseLinear):
+    """Linear layer with a standard Normal prior."""
+
+    @property
+    def loc(self):
+        return self.q_loc
+
+    @property
+    def scale(self):
+        return tfm.exp(0.5 * self.q_log_var)
+
+    @property
+    def predict_loc(self):
+        return self.loc
+
+    def sample_posterior(self, batch_size):
+        return tfpd.Normal(self.loc, self.scale).sample(batch_size)
+
+
+class JeffreysLinear(NormalLinear):
     """Linear layer with a Normal-Jeffreys prior
 
     References:
@@ -75,131 +100,224 @@ def NJLayer(Layer):
     [3] Louizos, Christos, Karen Ullrich, and Max Welling. "Bayesian Compression for Deep Learning." NIPS (2017).
     """
 
-    def __init__(self, output_size, name=None):
-        super().__init__(name=name)
-        self.output_size = output_size
-
     @snt.once
     def _initialize(self, x):
-        init_scale = softplus_inverse(1e-3)
-        self.input_size = x.shape[-1] + 1
-        self.param_shape = [self.output_size, self.input_size]
-        initial_w = tf.random.normal(self.param_shape) / tf.sqrt(
-            tf.cast(self.input_size, tf.float32)
-        )
-        self._loc = tf.Variable(initial_w, name="loc")
-        self._scale = tf.Variable(
-            init_scale * tf.ones(self.param_shape),
-            name="scale",
-        )
-        self._z_loc = tf.Variable(self.param_shape, name="z_loc")
-        self._z_scale = tf.Variable(
-            init_scale * tf.ones(self.param_shape), name="z_scale"
-        )
+        super()._initialize(x)
+
+        # initialize parameter values
+        stdev = 1.0 / tf.sqrt(tf.cast(self.input_size, tf.float32))
+        z_loc = tf.ones(self.param_shape)
+        z_log_var = -12.0 + 1e-2 * tf.random.normal(self.param_shape)
+
+        self.z_loc = tf.Variable(z_loc, name="z_loc")
+        self.z_log_var = tf.Variable(z_log_var, name="z_log_var")
 
     @property
     def loc(self):
-        return self._loc
+        return self.q_loc * self.z_loc
 
     @property
     def scale(self):
-        return tf.math.softplus(self._scale)
-
-    @property
-    def z_scale(self):
-        return tf.math.softplus(self._z_scale)
-
-    @property
-    def z_loc(self):
-        return self._z_loc
-
-    @property
-    def post_dist(self):
-        (
-            self.z_mu.pow(2) * weight_var
-            + z_var * self.weight_mu.pow(2)
-            + z_var * weight_var
+        q_var = tfm.exp(self.q_log_var)
+        z_var = tfm.exp(self.z_log_var)
+        p_var = (
+            (q_var * (self.z_loc**2)) + (z_var * (self.q_loc**2)) + (z_var * q_var)
         )
-        w_var = self.scale**2
-        z_var = self.z_scale**2
-        w_loc2 = self.loc**2
-        z_loc2 = self.z_loc**2
-        p_var = z_loc2 * w_var + z_var * w_loc2 + z_var * w_var
-        p_scale = tfm.exp(tfm.log(p_var) * 0.5)
-        p_loc = self.loc * self.z_loc
-        return tfpd.Normal(p_loc, p_scale)
+        return tfm.exp(0.5 * tfm.log(p_var))
 
     @property
     def log_dropout_rate(self):
         epsilon = 1e-8
-        log_alpha = tfm.log(self.z_scale) - tfm.log(self.z_loc**2 + epsilon)
+        log_alpha = self.z_log_var - tfm.log(self.z_loc**2 + epsilon)
         return log_alpha
 
-    def __call__(self, x):
-        self._initialize(x)
-        batch_size = tf.shape(x)[0]
-        param = self.post_dist.sample(batch_size)
-        w = param[..., :-1]
-        b = param[..., -1]
-        y = tf.linalg.matvec(w, x) + b
-        return y
-
-    def kl(self):
+    @property
+    def z_kl(self):
+        # KL(q(z)||p(z))
         k1, k2, k3 = 0.63576, 1.87320, 1.48695
-        log_alpha = self.log_droput_rate
-        kl1 = -tf.reduce_sum(
+        log_alpha = self.log_dropout_rate
+        kl = -tf.reduce_sum(
             k1 * tfm.sigmoid(k2 + k3 * log_alpha) - 0.5 * tfm.softplus(-log_alpha) - k1
         )
-        # KL(q(w|z)||p(w|z))
-        kl2 = -tf.math.log(self.scale) + 0.5 * (self.scale**2 + self.loc**2) - 0.5
-        return kl1 + kl2
+        return kl
 
-    def predict(self, x):
-        p_loc = self.post_dist.loc
-        w = p_loc[..., :-1]
-        b = p_loc[..., -1]
-        return (x @ tf.transpose(w)) + b
+    @property
+    def kl(self):
+        return super().kl + self.z_kl
+
+
+class HorseshoeLinear(BaseLinear):
+    """Linear layer with a horseshoe prior
+
+    References:
+    [1] Louizos, Christos, Karen Ullrich, and Max Welling. "Bayesian Compression for Deep Learning." NIPS (2017).
+    """
+
+    @snt.once
+    def _initialize(self, x):
+        super()._initialize(x)
+
+        # initialize parameter values
+        stdev = 1.0 / tf.sqrt(tf.cast(self.input_size, tf.float32))
+        sa_loc = 1.0
+        sb_loc = 1.0
+        a_loc = tf.ones(self.param_shape)
+        b_loc = tf.ones(self.param_shape)
+        q_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
+        sa_log_var = -9.0 + 1e-2 * tf.random.normal(())
+        sb_log_var = -9.0 + 1e-2 * tf.random.normal(())
+        a_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
+        b_log_var = -9.0 + 1e-2 * tf.random.normal(self.param_shape)
+        tau0 = 1.0
+
+        self.tau0 = tf.Variable(tau0, name="tau0")
+        self.a_loc = tf.Variable(a_loc, name="a_loc")
+        self.b_loc = tf.Variable(b_loc, name="b_loc")
+        self.sa_loc = tf.Variable(sa_loc, name="sa_loc")
+        self.sb_loc = tf.Variable(sb_loc, name="sb_loc")
+        self.a_log_var = tf.Variable(a_log_var, name="a_log_var")
+        self.b_log_var = tf.Variable(b_log_var, name="b_log_var")
+        self.sa_log_var = tf.Variable(sa_log_var, name="sa_log_var")
+        self.sb_log_var = tf.Variable(sb_log_var, name="sb_log_var")
+
+    @property
+    def scale(self):
+        sa_var = tfm.exp(self.sa_log_var)
+        sb_var = tfm.exp(self.sb_log_var)
+        s_var = 0.25 * (sa_var + sb_var)
+        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
+
+        a_var = tfm.exp(self.a_log_var)
+        b_var = tfm.exp(self.b_log_var)
+        zt_var = 0.25 * (a_var + b_var)
+        zt_loc = 0.5 * (self.a_loc + self.b_loc)
+
+        z_loc = zt_loc + s_loc
+        z_var = zt_var + s_var
+
+        q_var = tfm.exp(self.q_log_var)
+
+        v = (
+            (tfm.exp(z_var) - 1)
+            * tfm.exp(2.0 * z_loc + z_var)
+            * (q_var + (self.q_loc**2.0))
+        )
+        v += q_var * tfm.exp(2.0 * z_loc + z_var)
+        return tfm.exp(0.5 * tfm.log(v))
+
+    @property
+    def loc(self):
+        sa_var = tfm.exp(self.sa_log_var)
+        sb_var = tfm.exp(self.sb_log_var)
+        s_var = 0.25 * (sa_var + sb_var)
+        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
+
+        a_var = tfm.exp(self.a_log_var)
+        b_var = tfm.exp(self.b_log_var)
+        zt_var = 0.25 * (a_var + b_var)
+        zt_loc = 0.5 * (self.a_loc + self.b_loc)
+
+        z_loc = zt_loc + s_loc
+        z_var = zt_var + s_var
+        return tfm.exp(z_loc + 0.5 * z_var) * self.q_loc
+
+    def sample_posterior(self, batch_size: int):
+        sa_var = tfm.exp(self.sa_log_var)
+        sb_var = tfm.exp(self.sb_log_var)
+        s_var = 0.25 * (sa_var + sb_var)
+        s_scale = tfm.exp(0.5 * tfm.log(s_var))
+        s_loc = 0.5 * (self.sa_loc + self.sb_loc)
+
+        a_var = tfm.exp(self.a_log_var)
+        b_var = tfm.exp(self.b_log_var)
+        zt_var = 0.25 * (a_var + b_var)
+        zt_scale = tfm.exp(0.5 * tfm.log(zt_var))
+        zt_loc = 0.5 * (self.a_loc + self.b_loc)
+
+        s = tfpd.LogNormal(s_loc, s_scale).sample(batch_size)
+        zt = tfpd.LogNormal(zt_loc, zt_scale).sample(batch_size)
+        q_scale = tfm.exp(0.5 * self.q_log_var)
+        wt = tfpd.Normal(self.q_loc, q_scale).sample(batch_size)
+        w = s[..., None, None] * zt * wt
+
+        return w
+
+    @property
+    def sa_kl(self):
+        kl = -tfm.log(self.tau0)
+        sa_var = tfm.exp(self.sa_log_var)
+        kl -= tfm.exp(self.sa_loc + 0.5 * sa_var)
+        kl -= 0.5 * (self.sa_loc + self.sa_log_var + 1.0 + tfm.log(2.0))
+        return kl
+
+    @property
+    def sb_kl(self):
+        sb_var = tfm.exp(self.sb_log_var)
+        kl = tfm.exp(0.5 * sb_var - self.sb_loc)
+        kl -= 0.5 * (-self.sb_loc + self.sb_log_var + 1 + tfm.log(2.0))
+        return kl
+
+    @property
+    def a_kl(self):
+        a_var = tfm.exp(self.a_log_var)
+        kl = tfm.exp(self.a_loc + 0.5 * a_var)
+        kl -= 0.5 * (self.a_loc + self.a_log_var + 1.0 + tfm.log(2.0))
+        return tf.reduce_sum(kl)
+
+    @property
+    def b_kl(self):
+        b_var = tfm.exp(self.b_log_var)
+        kl = tfm.exp(0.5 * b_var - self.b_loc)
+        kl -= 0.5 * (-self.b_loc + self.b_log_var + 1.0 + tfm.log(2.0))
+        return tf.reduce_sum(kl)
+
+    @property
+    def kl(self):
+        return super().kl + self.sa_kl + self.sb_kl + self.a_kl + self.b_kl
 
 
 layer_collection = {
-    "normal": Layer,
-    "jeffreys": NJLayer,
+    "normal": NormalLinear,
+    "jeffreys": JeffreysLinear,
+    "horseshoe": HorseshoeLinear,
 }
 
 
 class BNN(snt.Module):
     def __init__(
-        self, hidden_size: int, n_layers: int, weight_prior: str = "normal", name=None
+        self,
+        output_sizes: Iterable[int] = [300, 100, 10],
+        weight_prior: str = "normal",
+        name=None,
     ):
         super().__init__(name=name)
-        self.hidden_size = hidden_size
-        self.n_layers = n_layers
+        self.output_sizes = output_sizes
         self.flatten = snt.Flatten()
         build_layer = layer_collection[weight_prior]
+
         self.layers = [
-            build_layer(hidden_size, name=f"layer{l}") for l in range(n_layers - 1)
+            build_layer(size, name=f"layer{l}") for (l, size) in enumerate(output_sizes)
         ]
-        self.logits = build_layer(10, name="logit_layer")
 
     def __call__(self, x):
         x = self.flatten(x)
-        for layer in self.layers:
+        for layer in self.layers[:-1]:
             x = layer(x)
             x = tf.nn.relu(x)
-        x = self.logits(x)
+        x = self.layers[-1](x)
         return x
 
     def predict(self, x):
         x = self.flatten(x)
-        for layer in self.layers:
+        for layer in self.layers[:-1]:
             x = layer.predict(x)
             x = tf.nn.relu(x)
-        x = self.logits(tf.nn.relu(x))
+        x = self.layers[-1](x)
         return x
 
     @property
     def kl(self):
-        return sum(layer.kl() for layer in self.layers)
+        return sum(layer.kl for layer in self.layers)
 
     @property
     def scale(self):

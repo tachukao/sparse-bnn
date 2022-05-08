@@ -13,12 +13,11 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_float("learning_rate", 2e-3, "Learning rate.")
-flags.DEFINE_float("anneal_rate", 2e-4, "Anneal rate.")
+flags.DEFINE_float("learning_rate", 1e-3, "Learning rate.")
+flags.DEFINE_float("anneal_rate", None, "Anneal rate.")
 flags.DEFINE_integer("train_batch_size", 128, "Training batch size.")
 flags.DEFINE_integer("test_batch_size", 1000, "Testing batch size.")
 flags.DEFINE_integer("num_epochs", 500, "Number of training epochs.")
-flags.DEFINE_integer("hidden_size", 128, "Number of hidden units.")
 flags.DEFINE_string("save_dir", "/scratches/cblgpu03/tck29/sbnn", "Results directory.")
 flags.DEFINE_string("weight_prior", "normal", "Prior placed on weights.")
 
@@ -53,6 +52,8 @@ def mnist(split: str, batch_size: int) -> tf.data.Dataset:
 
 
 def anneal_fn(step):
+    if FLAGS.anneal_rate is None:
+        return 1.0
     step = tf.cast(step, tf.float32)
     return 1 - tf.math.exp(-step * FLAGS.anneal_rate)
 
@@ -79,6 +80,7 @@ def train_step(
     variables = model.trainable_variables
     gradients = tape.gradient(loss, variables)
     optimizer.apply(gradients, variables)
+
     return {
         "loss": loss,
         "nlp": nlp,
@@ -124,7 +126,7 @@ def test_accuracy(
 def main(unused_argv):
     del unused_argv
 
-    model = netlib.BNN(FLAGS.hidden_size, 4)
+    model = netlib.BNN(weight_prior=FLAGS.weight_prior)
     optimizer = snt.optimizers.Adam(FLAGS.learning_rate)
 
     train_data, train_info = mnist("train", batch_size=FLAGS.train_batch_size)
